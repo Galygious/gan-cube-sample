@@ -6,5 +6,5 @@ Demo includes approach to proper time measurement and gyroscope event handling.
 
 Compiled live version of this application is available here:
  
- - https://afedotov.github.io/gan-cube-sample/
+ - https://galygious.github.io/gan-cube-sample/
 
