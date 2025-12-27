@@ -1097,6 +1097,7 @@ async function handleGyroEvent(event: GanCubeEvent) {
 
 async function handleMoveEvent(event: GanCubeEvent) {
   if (event.type == "MOVE") {
+    console.log(`MOVE event received: ${event.move}, current state: ${timerState}`);
     if (timerState == "READY") {
       setTimerState("RUNNING");
     }
@@ -1185,6 +1186,9 @@ async function handleFaceletsEvent(event: GanCubeEvent) {
 
 function handleCubeEvent(event: GanCubeEvent) {
   logToUIConsole(event);
+  if (event.type === "MOVE") {
+    console.log("Global MOVE event detected");
+  }
   if (event.type != "GYRO")
     console.log("GanCubeEvent", event);
   if (event.type == "GYRO") {
@@ -1339,6 +1343,7 @@ $('#reset-gyro').on('click', async () => {
 // --- Timer Logic ---
 
 function setTimerState(state: typeof timerState) {
+  console.log(`Timer state transition: ${timerState} -> ${state}`);
   timerState = state;
   switch (state) {
     case "IDLE":
@@ -1357,9 +1362,16 @@ function setTimerState(state: typeof timerState) {
     case 'STOPPED':
       stopLocalTimer();
       $('#timer').css('color', '#fff');
-      var fittedMoves = cubeTimestampLinearFit(solutionMoves);
-      var lastMove = fittedMoves.slice(-1).pop();
-      setTimerValue(lastMove ? lastMove.cubeTimestamp! : 0);
+      if (solutionMoves.length > 0) {
+        var fittedMoves = cubeTimestampLinearFit(solutionMoves);
+        var firstMove = fittedMoves[0];
+        var lastMove = fittedMoves[fittedMoves.length - 1];
+        var duration = lastMove.cubeTimestamp! - firstMove.cubeTimestamp!;
+        setTimerValue(duration);
+        console.log(`Solve duration: ${duration}ms (based on ${fittedMoves.length} moves)`);
+      } else {
+        setTimerValue(0);
+      }
       break;
   }
 }
@@ -1370,9 +1382,10 @@ function setTimerValue(timestamp: number) {
 }
 
 function startLocalTimer() {
-  var startTime = now();
+  console.log("Starting local timer ticker...");
+  const startTime = performance.now();
   localTimer = interval(30).subscribe(() => {
-    setTimerValue(now() - startTime);
+    setTimerValue(performance.now() - startTime);
   });
 }
 
@@ -1382,16 +1395,20 @@ function stopLocalTimer() {
 }
 
 function activateTimer() {
-  if (timerState == "IDLE" && conn) {
-    setTimerState("READY");
-  } else {
-    setTimerState("IDLE");
+  if (conn) {
+    if (timerState == "IDLE" || timerState == "STOPPED") {
+      setTimerState("READY");
+    } else {
+      setTimerState("IDLE");
+    }
   }
 }
 
 $(document).on('keydown', (event) => {
-  if (event.which == 32) {
+  if (event.which == 32) { // Space
+    if (event.originalEvent?.repeat) return;
     event.preventDefault();
+    console.log("Space pressed, activating timer...");
     activateTimer();
   }
 });
