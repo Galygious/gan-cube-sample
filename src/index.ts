@@ -10,7 +10,6 @@ import { randomScrambleForEvent } from 'cubing/scramble';
 import min2phase from './min2phase.js';
 import { CFOPSolver } from './cfop-solver';
 import {
-  now,
   connectGanCube,
   GanCubeConnection,
   GanCubeEvent,
