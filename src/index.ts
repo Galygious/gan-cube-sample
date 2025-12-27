@@ -8,6 +8,7 @@ import { gsap } from 'gsap';
 import { randomScrambleForEvent } from 'cubing/scramble';
 // @ts-ignore
 import min2phase from './min2phase.js';
+import { CFOPSolver } from './cfop-solver';
 import {
   now,
   connectGanCube,
@@ -19,6 +20,7 @@ import {
   cubeTimestampCalcSkew,
   cubeTimestampLinearFit
 } from 'gan-web-bluetooth';
+import { faceletsToPattern, patternToFacelets } from './utils';
 
 // --- HMR Cleanup ---
 document.getElementById('cube-container')?.querySelectorAll('canvas').forEach(c => c.remove());
@@ -955,22 +957,56 @@ async function solveCube() {
     console.log("Cube is already solved!");
     return;
   }
+
+  const solverType = $('#solver-type').val() as string;
   
   try {
-    console.log("Solving cube with facelets:", lastFacelets);
-    const solutionStr = min2phase.solve(lastFacelets);
-    if (solutionStr.startsWith("Error")) {
-      throw new Error(solutionStr);
+    console.log(`Solving cube (${solverType}) with facelets:`, lastFacelets);
+    
+    if (solverType === 'cfop') {
+      const solver = await CFOPSolver.create();
+      const pattern = faceletsToPattern(lastFacelets);
+      const steps = await solver.solve(pattern);
+      
+      let totalSolution: string[] = [];
+      let displayHtml = '';
+      
+      steps.forEach(step => {
+        if (step.moves && !step.moves.startsWith('//')) {
+          const moveParts = step.moves.split(/\s+/).filter(m => m.trim().length > 0);
+          totalSolution.push(...moveParts);
+          displayHtml += `<div style="margin-bottom: 4px;"><strong>${step.name}:</strong> ${step.moves}</div>`;
+        } else {
+          displayHtml += `<div style="margin-bottom: 4px;"><strong>${step.name}:</strong> <span style="color: #888;">${step.moves}</span></div>`;
+        }
+      });
+
+      currentScramble = totalSolution;
+      scrambleIndex = 0;
+      accumulatedMoveAmount = 0;
+      
+      $('#scramble-text').html(displayHtml || "Solution found");
+      $('#scramble-display').show();
+      console.log("CFOP Solution steps:", steps);
+    } else {
+      const solutionStr = min2phase.solve(lastFacelets);
+      if (solutionStr.startsWith("Error")) {
+        throw new Error(solutionStr);
+      }
+      
+      currentScramble = solutionStr.trim().split(/\s+/);
+      scrambleIndex = 0;
+      accumulatedMoveAmount = 0;
+      
+      $('#scramble-text').text(solutionStr);
+      $('#scramble-display').show();
+      console.log("Solution found:", solutionStr);
     }
     
-    currentScramble = solutionStr.trim().split(/\s+/);
-    scrambleIndex = 0;
-    accumulatedMoveAmount = 0;
-    $('#scramble-display').show();
     updateHighlighter();
-    console.log("Solution found:", solutionStr);
   } catch (e) {
     console.error("Solver failed", e);
+    alert("Could not find a solution: " + e);
   }
 }
 
