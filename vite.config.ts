@@ -5,6 +5,7 @@ import { viteSingleFile } from "vite-plugin-singlefile"
 const workerImportMetaUrlRE = /\bnew\s+(?:Worker|SharedWorker)\s*\(\s*(new\s+URL\s*\(\s*('[^']+'|"[^"]+"|`[^`]+`)\s*,\s*import\.meta\.url\s*\))/g;
 
 export default defineConfig({
+    base: '/gan-cube-sample/',
     plugins: [viteSingleFile()],
     build: {
         chunkSizeWarningLimit: 2048
