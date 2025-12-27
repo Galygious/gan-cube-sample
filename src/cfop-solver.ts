@@ -1,5 +1,4 @@
-import { KPattern, KPuzzle } from 'cubing/kpuzzle';
-import { cube3x3x3 } from 'cubing/puzzles';
+import { KPattern } from 'cubing/kpuzzle';
 import { Alg } from 'cubing/alg';
 
 export interface CFOPStep {
@@ -8,16 +7,13 @@ export interface CFOPStep {
 }
 
 export class CFOPSolver {
-    private puzzle: KPuzzle;
     private allowedMoves = ["U", "U'", "U2", "D", "D'", "D2", "L", "L'", "L2", "R", "R'", "R2", "F", "F'", "F2", "B", "B'", "B2"];
 
-    constructor(puzzle: KPuzzle) {
-        this.puzzle = puzzle;
+    constructor() {
     }
 
     static async create(): Promise<CFOPSolver> {
-        const puzzle = await cube3x3x3.kpuzzle();
-        return new CFOPSolver(puzzle);
+        return new CFOPSolver();
     }
 
     async solve(pattern: KPattern): Promise<CFOPStep[]> {

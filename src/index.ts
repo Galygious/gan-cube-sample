@@ -20,7 +20,7 @@ import {
   cubeTimestampCalcSkew,
   cubeTimestampLinearFit
 } from 'gan-web-bluetooth';
-import { faceletsToPattern, patternToFacelets } from './utils';
+import { faceletsToPattern } from './utils';
 
 // --- HMR Cleanup ---
 document.getElementById('cube-container')?.querySelectorAll('canvas').forEach(c => c.remove());
