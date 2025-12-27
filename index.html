@@ -4,10 +4,169 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Base Sphere</title>
+  <style>
+    .controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 100;
+      display: flex;
+      gap: 10px;
+    }
+    .info {
+      position: absolute;
+      top: 50px;
+      left: 10px;
+      z-index: 100;
+      color: white;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 10px;
+      border-radius: 5px;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 5px;
+      font-size: 12px;
+    }
+    .info label {
+      font-weight: bold;
+    }
+    .info input {
+      background: transparent;
+      border: none;
+      color: white;
+      width: 150px;
+    }
+    #timer {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 100;
+      color: white;
+      font-size: 48px;
+      font-family: monospace;
+    }
+    .help {
+      position: absolute;
+      bottom: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 100;
+      color: #999;
+      font-size: 14px;
+      text-align: center;
+      width: 80%;
+    }
+    #bt-console {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      width: 300px;
+      height: 400px;
+      background: rgba(0, 0, 0, 0.8);
+      border: 1px solid #444;
+      border-radius: 5px;
+      display: flex;
+      flex-direction: column;
+      z-index: 100;
+      font-family: monospace;
+      color: #0f0;
+      font-size: 11px;
+    }
+    .console-header {
+      padding: 5px 10px;
+      background: #222;
+      border-bottom: 1px solid #444;
+      font-weight: bold;
+      color: #ccc;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .console-toggles {
+      display: flex;
+      gap: 8px;
+      font-size: 10px;
+    }
+    .console-toggles label {
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .console-toggles input {
+      margin: 0;
+    }
+    .console-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 5px;
+    }
+    .console-entry {
+      margin-bottom: 4px;
+      border-bottom: 1px solid #222;
+      padding-bottom: 2px;
+      word-break: break-all;
+    }
+    .console-entry .timestamp {
+      color: #888;
+      margin-right: 5px;
+    }
+    .console-entry.type-MOVE { color: #fff; }
+    .console-entry.type-GYRO { color: #666; }
+    .console-entry.type-FACELETS { color: #ff0; }
+    .console-entry.type-BATTERY { color: #0af; }
+  </style>
 </head>
 <body>
   <div id="app">
+    <div class="help">
+      Scramble cube to arbitrary state then press SPACE or touch Cube
+      to activate basic solving timer
+    </div>
     <div id="cube-container" style="width: 100vw; height: 100vh; background: #111;"></div>
+    
+    <div class="controls">
+      <button id="connect">Connect</button>
+      <button id="reset-state">Reset State</button>
+      <button id="reset-gyro">Reset Gyro</button>
+      <button id="generate-scramble">Scramble</button>
+      <button id="solve-cube">Solve</button>
+    </div>
+
+    <div id="scramble-display" style="position: absolute; top: 100px; left: 50%; transform: translateX(-50%); color: #fff; font-size: 20px; font-family: monospace; background: rgba(0,0,0,0.6); padding: 10px 20px; border-radius: 8px; display: none; text-align: center; max-width: 80%; z-index: 100;">
+      <div id="scramble-text"></div>
+      <div id="scramble-progress" style="font-size: 14px; color: #aaa; margin-top: 5px;"></div>
+    </div>
+
+    <div class="info">
+      <label for="deviceName">Device Name</label>
+      <input id="deviceName" type="text" readonly value="- n/a -">
+      <label for="deviceMAC">Device MAC</label>
+      <input id="deviceMAC" type="text" readonly value="- n/a -">
+      <label for="batteryLevel">Battery</label>
+      <input id="batteryLevel" type="text" readonly value="- n/a -">
+      <label for="skew">Clock Skew</label>
+      <input id="skew" type="text" readonly value="- n/a -">
+      <label for="quaternion">Quaternion</label>
+      <input id="quaternion" type="text" readonly value="- n/a -">
+    </div>
+
+    <div id="timer">0:00.000</div>
+
+    <div id="bt-console">
+      <div class="console-header">
+        <span>Bluetooth Packets</span>
+        <div class="console-toggles">
+          <label><input type="checkbox" id="log-gyro" checked> Gyro</label>
+          <label><input type="checkbox" id="log-move" checked> Move</label>
+          <label><input type="checkbox" id="log-facelets" checked> Face</label>
+          <button id="console-copy" style="font-size: 9px; padding: 0 4px;">Copy</button>
+          <button id="console-clear" style="font-size: 9px; padding: 0 4px;">Clear</button>
+        </div>
+      </div>
+      <div class="console-body" id="bt-console-body"></div>
+    </div>
   </div>
   <script type="module" src="/src/index.ts"></script>
 </body>

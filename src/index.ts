@@ -1,31 +1,329 @@
 import './style.css'
+import $ from 'jquery';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { TrackballControls } from 'three/examples/jsm/controls/TrackballControls.js';
 import { CSG } from 'three-csg-ts';
+import { Subscription, interval } from 'rxjs';
+import { gsap } from 'gsap';
+import { randomScrambleForEvent } from 'cubing/scramble';
+// @ts-ignore
+import min2phase from './min2phase.js';
+import {
+  now,
+  connectGanCube,
+  GanCubeConnection,
+  GanCubeEvent,
+  GanCubeMove,
+  MacAddressProvider,
+  makeTimeFromTimestamp,
+  cubeTimestampCalcSkew,
+  cubeTimestampLinearFit
+} from 'gan-web-bluetooth';
 
 // --- HMR Cleanup ---
 document.getElementById('cube-container')?.querySelectorAll('canvas').forEach(c => c.remove());
 
 // --- Setup ---
 const scene = new THREE.Scene();
+const mainCubeGroup = new THREE.Group();
+scene.add(mainCubeGroup);
+
+const highlighterGroup = new THREE.Group();
+mainCubeGroup.add(highlighterGroup);
+
 const container = document.getElementById('cube-container')!;
 const camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setSize(container.clientWidth, container.clientHeight);
 container.appendChild(renderer.domElement);
 
-const controls = new OrbitControls(camera, renderer.domElement);
+const controls = new TrackballControls(camera, renderer.domElement);
+controls.rotateSpeed = 4.0;
+controls.dynamicDampingFactor = 0.1;
 camera.position.set(3, 3, 3);
 controls.update();
 
 // Basic Lighting
-scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-dirLight.position.set(5, 5, 5);
-scene.add(dirLight);
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+const light1 = new THREE.DirectionalLight(0xffffff, 1.0);
+light1.position.set(5, 10, 7);
+scene.add(light1);
+
+const light2 = new THREE.DirectionalLight(0xffffff, 0.5);
+light2.position.set(-5, -5, -5);
+scene.add(light2);
+
+// Create a simple environment map for reflections
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+pmremGenerator.compileEquirectangularShader();
+scene.environment = pmremGenerator.fromScene(new THREE.Scene()).texture;
 
 // --- Constants ---
 const cubieSize = 1;
+const SPACING = 1.05;
+const SOLVED_STATE = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
+const ANIMATION_DURATION = 0.05; // Speed of cube turns in seconds
+
+var conn: GanCubeConnection | null = null;
+var lastMoves: GanCubeMove[] = [];
+var solutionMoves: GanCubeMove[] = [];
+
+var cubeQuaternion: THREE.Quaternion = new THREE.Quaternion();
+var basis: THREE.Quaternion | null = null;
+var lastVelocity: THREE.Vector3 = new THREE.Vector3();
+var lastGyroTimestamp: number = 0;
+
+var timerState: "IDLE" | "READY" | "RUNNING" | "STOPPED" = "IDLE";
+var localTimer: Subscription | null = null;
+
+var lastFacelets: string = SOLVED_STATE;
+var currentScramble: string[] = [];
+var scrambleIndex: number = -1;
+var accumulatedMoveAmount: number = 0;
+
+const cubies: THREE.Group[] = [];
+let isProcessingQueue = false;
+const moveQueue: string[] = [];
+let cubeStateInitialized = false;
+
+// --- State Application ---
+
+const FACE_NORMALS: Record<string, THREE.Vector3> = {
+  'U': new THREE.Vector3(0, 1, 0),
+  'D': new THREE.Vector3(0, -1, 0),
+  'F': new THREE.Vector3(0, 0, 1),
+  'B': new THREE.Vector3(0, 0, -1),
+  'L': new THREE.Vector3(-1, 0, 0),
+  'R': new THREE.Vector3(1, 0, 0),
+};
+
+const SLOT_STICKERS: Record<string, { face: string, index: number }[]> = {
+  // Centers
+  'U': [{ face: 'U', index: 4 }],
+  'D': [{ face: 'D', index: 31 }],
+  'F': [{ face: 'F', index: 22 }],
+  'R': [{ face: 'R', index: 13 }],
+  'L': [{ face: 'L', index: 40 }],
+  'B': [{ face: 'B', index: 49 }],
+  // Edges
+  'UF': [{ face: 'U', index: 7 }, { face: 'F', index: 19 }],
+  'UL': [{ face: 'U', index: 3 }, { face: 'L', index: 37 }],
+  'UB': [{ face: 'U', index: 1 }, { face: 'B', index: 46 }],
+  'UR': [{ face: 'U', index: 5 }, { face: 'R', index: 10 }],
+  'DF': [{ face: 'D', index: 28 }, { face: 'F', index: 25 }],
+  'DL': [{ face: 'D', index: 30 }, { face: 'L', index: 43 }],
+  'DB': [{ face: 'D', index: 34 }, { face: 'B', index: 52 }],
+  'DR': [{ face: 'D', index: 32 }, { face: 'R', index: 16 }],
+  'FL': [{ face: 'F', index: 21 }, { face: 'L', index: 41 }],
+  'FR': [{ face: 'F', index: 23 }, { face: 'R', index: 12 }],
+  'BL': [{ face: 'B', index: 50 }, { face: 'L', index: 39 }],
+  'BR': [{ face: 'B', index: 48 }, { face: 'R', index: 14 }],
+  // Corners
+  'UFL': [{ face: 'U', index: 6 }, { face: 'F', index: 18 }, { face: 'L', index: 38 }],
+  'UFR': [{ face: 'U', index: 8 }, { face: 'F', index: 20 }, { face: 'R', index: 9 }],
+  'UBR': [{ face: 'U', index: 2 }, { face: 'R', index: 11 }, { face: 'B', index: 45 }],
+  'UBL': [{ face: 'U', index: 0 }, { face: 'B', index: 47 }, { face: 'L', index: 36 }],
+  'DFL': [{ face: 'D', index: 27 }, { face: 'F', index: 24 }, { face: 'L', index: 44 }],
+  'DFR': [{ face: 'D', index: 29 }, { face: 'F', index: 26 }, { face: 'R', index: 15 }],
+  'DBR': [{ face: 'D', index: 35 }, { face: 'B', index: 51 }, { face: 'R', index: 17 }],
+  'DBL': [{ face: 'D', index: 33 }, { face: 'B', index: 53 }, { face: 'L', index: 42 }]
+};
+
+const COLOR_TO_FACE: Record<number, string> = {
+  [0xffffff]: 'U', // Top
+  [0xffff00]: 'D', // Bottom
+  [0x00ff00]: 'F', // Front
+  [0x0000ff]: 'B', // Back
+  [0xffa500]: 'L', // Left
+  [0xff0000]: 'R',  // Right
+};
+
+function applyFacelets(facelets: string) {
+  console.log("Applying facelets to digital cube pieces...");
+  for (const slotName in SLOT_STICKERS) {
+    const slotInfo = SLOT_STICKERS[slotName];
+    const colorsAtSlot = slotInfo.map(s => facelets[s.index]);
+    
+    // Find the piece that has these colors (regardless of orientation)
+    const piece = cubies.find(c => {
+      const bc = c.userData.baseColors;
+      const pieceColors = Object.entries(bc)
+        .filter(([key, val]) => key !== 'Plastic' && val !== undefined)
+        .map(([_, val]) => COLOR_TO_FACE[val as number]);
+      
+      if (pieceColors.length !== colorsAtSlot.length) return false;
+      return colorsAtSlot.every(color => pieceColors.includes(color));
+    });
+
+    if (!piece) {
+      console.warn(`Could not find piece for slot ${slotName} with colors ${colorsAtSlot}`);
+      continue;
+    }
+
+    // 1. Move piece to slot position
+    const slotPos = (SLOTS as any)[slotName];
+    piece.position.set(slotPos.x * SPACING, slotPos.y * SPACING, slotPos.z * SPACING);
+
+    // 2. Orient piece
+    const bc = piece.userData.baseColors;
+    
+    // Find local axis for each color of the piece
+    const getLocalAxis = (color: string) => {
+      if (COLOR_TO_FACE[bc.Top] === color) return new THREE.Vector3(0, 1, 0);
+      if (COLOR_TO_FACE[bc.Bottom] === color) return new THREE.Vector3(0, -1, 0);
+      if (COLOR_TO_FACE[bc.Front] === color) return new THREE.Vector3(0, 0, 1);
+      if (COLOR_TO_FACE[bc.Back] === color) return new THREE.Vector3(0, 0, -1);
+      if (COLOR_TO_FACE[bc.Left] === color) return new THREE.Vector3(-1, 0, 0);
+      if (COLOR_TO_FACE[bc.Right] === color) return new THREE.Vector3(1, 0, 0);
+      return null;
+    };
+
+    const targetFace1 = slotInfo[0].face;
+    const colorOnFace1 = facelets[slotInfo[0].index];
+    const targetNormal1 = FACE_NORMALS[targetFace1];
+    const localAxis1 = getLocalAxis(colorOnFace1);
+
+    if (localAxis1 && slotInfo.length > 1) {
+      const targetFace2 = slotInfo[1].face;
+      const colorOnFace2 = facelets[slotInfo[1].index];
+      const targetNormal2 = FACE_NORMALS[targetFace2];
+      const localAxis2 = getLocalAxis(colorOnFace2);
+
+      if (localAxis2) {
+        const localAxis3 = new THREE.Vector3().crossVectors(localAxis1, localAxis2);
+        const targetNormal3 = new THREE.Vector3().crossVectors(targetNormal1, targetNormal2);
+        
+        const matL = new THREE.Matrix4().makeBasis(localAxis1, localAxis2, localAxis3);
+        const matT = new THREE.Matrix4().makeBasis(targetNormal1, targetNormal2, targetNormal3);
+        const matM = matT.multiply(matL.invert());
+        
+        piece.quaternion.setFromRotationMatrix(matM);
+      }
+    } else if (localAxis1) {
+      piece.quaternion.setFromUnitVectors(localAxis1, targetNormal1);
+    }
+
+    // Snap to grid
+    piece.position.x = Math.round(piece.position.x / SPACING) * SPACING;
+    piece.position.y = Math.round(piece.position.y / SPACING) * SPACING;
+    piece.position.z = Math.round(piece.position.z / SPACING) * SPACING;
+  }
+}
+
+// --- Move Execution ---
+
+/**
+ * Maps a Face name to its rotation axis and plane coordinate
+ */
+const FACE_MAP: Record<string, { axis: 'x' | 'y' | 'z', value: number, direction: number }> = {
+  'U': { axis: 'y', value: 1,  direction: -1 },
+  'D': { axis: 'y', value: -1, direction: 1 },
+  'L': { axis: 'x', value: -1, direction: 1 },
+  'R': { axis: 'x', value: 1,  direction: -1 },
+  'F': { axis: 'z', value: 1,  direction: -1 },
+  'B': { axis: 'z', value: -1, direction: 1 },
+};
+
+async function animateMove(moveStr: string) {
+  // Parse move: e.g., "U", "U'", "U2"
+  const faceChar = moveStr[0];
+  const modifier = moveStr.substring(1);
+  const faceInfo = FACE_MAP[faceChar];
+
+  if (!faceInfo) return;
+
+  let angle = (Math.PI / 2) * faceInfo.direction;
+  if (modifier === "'") angle *= -1;
+  else if (modifier === "2") angle *= 2;
+
+  const pivot = new THREE.Group();
+  mainCubeGroup.add(pivot);
+
+  const piecesInLayer: THREE.Group[] = [];
+  const EPS = 0.2; 
+  
+  cubies.forEach(cubie => {
+    cubie.updateMatrix();
+    const pos = cubie.position;
+    const val = faceInfo.axis === 'x' ? pos.x : (faceInfo.axis === 'y' ? pos.y : pos.z);
+    if (Math.abs(val - faceInfo.value * SPACING) < EPS) {
+      piecesInLayer.push(cubie);
+    }
+  });
+
+  // Log debug info
+  const logEntry = document.createElement('div');
+  logEntry.className = 'console-entry';
+  logEntry.style.color = piecesInLayer.length === 9 ? '#0f0' : '#f00';
+  logEntry.innerHTML = `<span class="timestamp">[DEBUG]</span> Animating ${moveStr}: Found ${piecesInLayer.length} pieces`;
+  document.getElementById('bt-console-body')?.appendChild(logEntry);
+
+  piecesInLayer.forEach(p => pivot.attach(p));
+
+  // 4. Animate pivot using Quaternion Slerp
+  const startQuat = pivot.quaternion.clone();
+  const rotationAxis = new THREE.Vector3(
+    faceInfo.axis === 'x' ? 1 : 0,
+    faceInfo.axis === 'y' ? 1 : 0,
+    faceInfo.axis === 'z' ? 1 : 0
+  );
+  const endQuat = new THREE.Quaternion().setFromAxisAngle(rotationAxis, angle).multiply(startQuat);
+
+  const animObj = { t: 0 };
+  await gsap.to(animObj, {
+    t: 1,
+    duration: ANIMATION_DURATION,
+    ease: "power2.inOut",
+    onUpdate: () => {
+      pivot.quaternion.slerpQuaternions(startQuat, endQuat, animObj.t);
+    }
+  });
+
+  piecesInLayer.forEach(p => {
+    mainCubeGroup.attach(p);
+    p.position.x = Math.round(p.position.x / SPACING) * SPACING;
+    p.position.y = Math.round(p.position.y / SPACING) * SPACING;
+    p.position.z = Math.round(p.position.z / SPACING) * SPACING;
+  });
+  
+  mainCubeGroup.remove(pivot);
+}
+
+async function processQueue() {
+  if (isProcessingQueue || moveQueue.length === 0) return;
+  isProcessingQueue = true;
+
+  while (moveQueue.length > 0) {
+    const batch: string[] = [];
+    const firstMoveStr = moveQueue.shift()!;
+    batch.push(firstMoveStr);
+    
+    const firstMoveInfo = FACE_MAP[firstMoveStr[0]];
+    
+    // Look for compatible moves immediately following in the queue
+    while (moveQueue.length > 0) {
+      const nextMoveStr = moveQueue[0];
+      const nextMoveInfo = FACE_MAP[nextMoveStr[0]];
+      
+      // Compatible if same axis but different layer value
+      const isCompatible = nextMoveInfo && 
+                          nextMoveInfo.axis === firstMoveInfo.axis && 
+                          !batch.some(m => FACE_MAP[m[0]].value === nextMoveInfo.value);
+      
+      if (isCompatible) {
+        batch.push(moveQueue.shift()!);
+      } else {
+        break; // Stop batching to preserve order
+      }
+    }
+
+    // Run all moves in the batch simultaneously
+    await Promise.all(batch.map(move => animateMove(move)));
+  }
+
+  isProcessingQueue = false;
+}
 
 type Axis = 'x' | 'y' | 'z';
 type SignedAxis = '+x' | '-x' | '+y' | '-y' | '+z' | '-z';
@@ -149,6 +447,23 @@ function buildProfilePrism(axis: Axis, profile: BodyProfile, size: number): THRE
   return geo;
 }
 
+function createPhysicalMaterial(color: number, isSticker: boolean = false) {
+  return new THREE.MeshPhysicalMaterial({
+    color: color,
+    metalness: 0.1,
+    roughness: 0.1,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.05,
+    reflectivity: 1.0,
+    side: THREE.DoubleSide,
+    ...(isSticker ? {
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1
+    } : {})
+  });
+}
+
 function buildSolidBodyFromProfiles(profiles: BodyProfiles, material: THREE.Material, size: number): THREE.Mesh {
   // Start with a cube bounding volume, then intersect cross-section prisms along requested axes.
   let solid: THREE.Mesh = new THREE.Mesh(new THREE.BoxGeometry(size, size, size), material);
@@ -181,15 +496,6 @@ function addFaceColorPatchesFromBody(params: {
   const thickness = size * 0.02;
   const offset = size * 0.002;
 
-  const mkMat = (c: number) =>
-    new THREE.MeshLambertMaterial({
-      color: c,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1
-    });
-
   const faceDefs: Array<{
     key: keyof CubieOptions['colors'];
     slabSize: [number, number, number];
@@ -215,7 +521,7 @@ function addFaceColorPatchesFromBody(params: {
     slab.updateMatrix();
 
     const patch = CSG.intersect(body, slab);
-    patch.material = mkMat(c);
+    patch.material = createPhysicalMaterial(c, true);
     patch.geometry.computeVertexNormals();
     patch.geometry.translate(f.normal[0] * offset, f.normal[1] * offset, f.normal[2] * offset);
     group.add(patch);
@@ -223,12 +529,14 @@ function addFaceColorPatchesFromBody(params: {
 }
 
 interface CubieOptions {
-  x: number;
-  y: number;
-  z: number;
+  id: string;
+  x?: number;
+  y?: number;
+  z?: number;
   rx?: number;
   ry?: number;
   rz?: number;
+  slot?: { x: number, y: number, z: number, q?: THREE.Quaternion };
   /**
    * Legacy uniform rounding radius (applies to all axes).
    * Prefer `radiusX`/`radiusY`/`radiusZ` for per-axis control.
@@ -267,7 +575,11 @@ interface CubieOptions {
  * Modernized Cubie Assembly Function
  */
 function createCubie(opt: CubieOptions) {
-  const { x, y, z, rx, ry, rz, radius, radiusX, radiusY, radiusZ, profiles, activeEdges, colors } = opt;
+  const x = opt.slot ? opt.slot.x : (opt.x ?? 0);
+  const y = opt.slot ? opt.slot.y : (opt.y ?? 0);
+  const z = opt.slot ? opt.slot.z : (opt.z ?? 0);
+  
+  const { radius, radiusX, radiusY, radiusZ, profiles, activeEdges, colors } = opt;
   const half = cubieSize / 2;
   const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
   const rX = clamp(radiusX ?? radius ?? 0, 0, half);
@@ -277,11 +589,28 @@ function createCubie(opt: CubieOptions) {
   const innerX = half - rX;
   const innerY = half - rY;
   const innerZ = half - rZ;
-  const cubieGroup = new THREE.Group();
-  cubieGroup.position.set(x * cubieSize * 1.05, y * cubieSize * 1.05, z * cubieSize * 1.05);
-  cubieGroup.rotation.set(rx ?? 0, ry ?? 0, rz ?? 0);
 
-  const plasticMat = new THREE.MeshLambertMaterial({ color: colors.Plastic ?? 0x111111, side: THREE.DoubleSide });
+  const cubieGroup = new THREE.Group();
+  cubieGroup.userData.pieceId = opt.id;
+  cubieGroup.userData.baseColors = opt.colors;
+
+  cubieGroup.position.set(x * cubieSize * SPACING, y * cubieSize * SPACING, z * cubieSize * SPACING);
+  
+  if (opt.slot?.q) {
+    cubieGroup.quaternion.copy(opt.slot.q);
+  } else {
+    cubieGroup.rotation.set(opt.rx ?? 0, opt.ry ?? 0, opt.rz ?? 0);
+  }
+
+  // Store initial transform for Reset State
+  (cubieGroup as any)._initialTransform = {
+    position: cubieGroup.position.clone(),
+    quaternion: cubieGroup.quaternion.clone()
+  };
+
+  cubies.push(cubieGroup);
+
+  const plasticMat = createPhysicalMaterial(colors.Plastic ?? 0x111111);
 
   // --- Solid/profile mode (for "D in 2 axes" and other stacked profile constraints) ---
   if (profiles && (profiles.x || profiles.y || profiles.z)) {
@@ -289,7 +618,7 @@ function createCubie(opt: CubieOptions) {
     body.geometry.computeVertexNormals();
     cubieGroup.add(body);
     addFaceColorPatchesFromBody({ group: cubieGroup, body, colors, size: cubieSize });
-    scene.add(cubieGroup);
+    mainCubeGroup.add(cubieGroup);
     return;
   }
 
@@ -415,7 +744,7 @@ function createCubie(opt: CubieOptions) {
 
   faceConfigs.forEach(f => {
     if (f.c === undefined) return;
-    const faceMat = new THREE.MeshLambertMaterial({ color: f.c, side: THREE.DoubleSide });
+    const faceMat = createPhysicalMaterial(f.c);
     const [innerD1, innerD2] =
       f.ax === 'y' ? [innerX, innerZ] :
       f.ax === 'z' ? [innerX, innerY] :
@@ -467,17 +796,582 @@ function createCubie(opt: CubieOptions) {
     cubieGroup.add(m);
   });
 
-  scene.add(cubieGroup);
+  mainCubeGroup.add(cubieGroup);
 }
 
+// --- Scramble & Highlighting ---
+
+function createArrowGeometry() {
+  const shape = new THREE.Shape();
+  // Simple arrow shape pointing up (+Y)
+  shape.moveTo(0, 0.5);
+  shape.lineTo(0.3, 0.2);
+  shape.lineTo(0.1, 0.2);
+  shape.lineTo(0.1, -0.3);
+  shape.lineTo(-0.1, -0.3);
+  shape.lineTo(-0.1, 0.2);
+  shape.lineTo(-0.3, 0.2);
+  shape.closePath();
+
+  return new THREE.ExtrudeGeometry(shape, { depth: 0.05, bevelEnabled: false });
+}
+
+const arrowGeo = createArrowGeometry();
+const arrowMat = new THREE.MeshPhysicalMaterial({ 
+  color: 0x00ffff, 
+  transparent: true, 
+  opacity: 0.9, 
+  emissive: 0x00ffff, 
+  emissiveIntensity: 2,
+  side: THREE.DoubleSide 
+});
+
+function updateHighlighter() {
+  highlighterGroup.clear();
+  if (scrambleIndex < 0 || scrambleIndex >= currentScramble.length) {
+    $('#scramble-progress').text(scrambleIndex >= currentScramble.length ? 'Scramble Complete!' : '');
+    return;
+  }
+
+  console.log(`Updating highlighter for move: ${currentScramble[scrambleIndex]}`);
+
+  const moveStr = currentScramble[scrambleIndex];
+  const faceChar = moveStr[0];
+  const modifier = moveStr.substring(1);
+  const faceInfo = FACE_MAP[faceChar];
+  
+  if (!faceInfo) return;
+
+  // Create a container for this specific move's highlight
+  const moveHighlight = new THREE.Group();
+  
+  // Put arrows slightly out so they aren't obscured by corners
+  const dist = 1.8;
+  moveHighlight.position.set(
+    faceInfo.axis === 'x' ? faceInfo.value * dist : 0,
+    faceInfo.axis === 'y' ? faceInfo.value * dist : 0,
+    faceInfo.axis === 'z' ? faceInfo.value * dist : 0
+  );
+
+  // Rotate the group to face outwards from the cube face
+  if (faceInfo.axis === 'x') {
+    moveHighlight.rotation.y = (faceInfo.value > 0 ? 1 : -1) * Math.PI / 2;
+  } else if (faceInfo.axis === 'y') {
+    moveHighlight.rotation.x = (faceInfo.value > 0 ? -1 : 1) * Math.PI / 2;
+  } else if (faceInfo.axis === 'z') {
+    moveHighlight.rotation.y = (faceInfo.value > 0 ? 0 : 1) * Math.PI;
+  }
+
+  let isCCW = modifier === "'";
+  let isDouble = modifier === "2";
+  
+  // Orbit radius (slightly larger than center piece, smaller than face corners)
+  const curveRadius = 1.1;
+  const numArrows = 4;
+  
+  for (let i = 0; i < numArrows; i++) {
+    const arrow = new THREE.Mesh(arrowGeo, arrowMat);
+    const stepAngle = (i / numArrows) * Math.PI * 2;
+    
+    // Position tangentially on the ring
+    arrow.position.set(Math.cos(stepAngle) * curveRadius, Math.sin(stepAngle) * curveRadius, 0);
+    
+    // Rotate to point along the circle
+    const tangentialRotation = stepAngle + (isCCW ? 0 : Math.PI);
+    arrow.rotation.z = tangentialRotation;
+    
+    if (isDouble) {
+      arrow.scale.set(1.5, 1.5, 1.5);
+    }
+
+    moveHighlight.add(arrow);
+  }
+
+  // Add a glowing ring behind the arrows
+  const ringGeo = new THREE.TorusGeometry(curveRadius, 0.05, 16, 64);
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.4 });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  moveHighlight.add(ring);
+
+  highlighterGroup.add(moveHighlight);
+
+  $('#scramble-progress').text(`Next move: ${moveStr} (${scrambleIndex + 1}/${currentScramble.length})`);
+  
+  // Highlight the current move in the scramble text
+  const highlightedScramble = currentScramble.map((m, i) => 
+    i === scrambleIndex ? `<span style="color: #0ff; font-weight: bold; text-decoration: underline;">${m}</span>` : m
+  ).join(' ');
+  $('#scramble-text').html(highlightedScramble);
+}
+
+/**
+ * Fallback scramble generator for when cubing.js workers are blocked (e.g. file:// protocol)
+ */
+function getSimpleScramble(): string[] {
+  const faces = ['U', 'D', 'L', 'R', 'F', 'B'];
+  const modifiers = ['', "'", '2'];
+  const scramble: string[] = [];
+  let lastFace = '';
+  
+  for (let i = 0; i < 20; i++) {
+    let face;
+    do {
+      face = faces[Math.floor(Math.random() * faces.length)];
+    } while (face === lastFace);
+    
+    const modifier = modifiers[Math.floor(Math.random() * modifiers.length)];
+    scramble.push(face + modifier);
+    lastFace = face;
+  }
+  return scramble;
+}
+
+async function generateScramble() {
+  try {
+    // Try the official cubing.js generator first
+    const scramble = await randomScrambleForEvent('3x3x3');
+    currentScramble = scramble.toString().split(' ');
+  } catch (e) {
+    console.warn("cubing.js scramble failed (likely file:// protocol), using simple fallback.");
+    currentScramble = getSimpleScramble();
+  }
+  
+  scrambleIndex = 0;
+  $('#scramble-display').show();
+  updateHighlighter();
+}
+
+$('#generate-scramble').on('click', () => generateScramble());
+
+// Initialize min2phase
+try {
+  min2phase.initFull();
+} catch (e) {
+  console.warn("min2phase init failed", e);
+}
+
+async function solveCube() {
+  if (lastFacelets === SOLVED_STATE) {
+    console.log("Cube is already solved!");
+    return;
+  }
+  
+  try {
+    console.log("Solving cube with facelets:", lastFacelets);
+    const solutionStr = min2phase.solve(lastFacelets);
+    if (solutionStr.startsWith("Error")) {
+      throw new Error(solutionStr);
+    }
+    
+    currentScramble = solutionStr.trim().split(/\s+/);
+    scrambleIndex = 0;
+    accumulatedMoveAmount = 0;
+    $('#scramble-display').show();
+    updateHighlighter();
+    console.log("Solution found:", solutionStr);
+  } catch (e) {
+    console.error("Solver failed", e);
+  }
+}
+
+$('#solve-cube').on('click', () => solveCube());
+
+// --- Connection Handlers ---
+
+function logToUIConsole(event: GanCubeEvent) {
+  const body = document.getElementById('bt-console-body');
+  if (!body) return;
+
+  // Check toggles
+  if (event.type === 'GYRO' && !($('#log-gyro').is(':checked'))) return;
+  if (event.type === 'MOVE' && !($('#log-move').is(':checked'))) return;
+  if (event.type === 'FACELETS' && !($('#log-facelets').is(':checked'))) return;
+
+  const entry = document.createElement('div');
+  entry.className = `console-entry type-${event.type}`;
+  
+  const timestamp = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const ms = new Date().getMilliseconds().toString().padStart(3, '0');
+  
+  let details = '';
+  if (event.type === 'MOVE') details = `: ${event.move}`;
+  else if (event.type === 'FACELETS') details = `: ${event.facelets.substring(0, 10)}...`;
+  else if (event.type === 'GYRO') details = `: Q(${event.quaternion.x.toFixed(2)}, ${event.quaternion.y.toFixed(2)}...)`;
+  else if (event.type === 'BATTERY') details = `: ${event.batteryLevel}%`;
+  else if (event.type === 'HARDWARE') details = `: ${event.hardwareName} v${event.hardwareVersion}`;
+
+  entry.innerHTML = `<span class="timestamp">[${timestamp}.${ms}]</span><strong>${event.type}</strong>${details}`;
+  
+  body.appendChild(entry);
+  
+  // Limit entries
+  while (body.children.length > 100) {
+    body.removeChild(body.firstChild!);
+  }
+  
+  // Auto-scroll to bottom
+  body.scrollTop = body.scrollHeight;
+}
+
+$('#console-clear').on('click', () => {
+  const body = document.getElementById('bt-console-body');
+  if (body) body.innerHTML = '';
+});
+
+$('#console-copy').on('click', () => {
+  const body = document.getElementById('bt-console-body');
+  if (!body) return;
+  const text = body.innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('console-copy');
+    if (btn) {
+      const original = btn.innerText;
+      btn.innerText = 'Copied!';
+      setTimeout(() => btn.innerText = original, 1000);
+    }
+  });
+});
+
+async function handleGyroEvent(event: GanCubeEvent) {
+  if (event.type == "GYRO") {
+    let { x: qx, y: qy, z: qz, w: qw } = event.quaternion;
+    let quat = new THREE.Quaternion(qx, qz, -qy, qw).normalize();
+    
+    if (!basis) {
+      const m = new THREE.Matrix4();
+      m.lookAt(new THREE.Vector3(0, 0, 0), camera.position, camera.up);
+      const targetQuat = new THREE.Quaternion().setFromRotationMatrix(m);
+      basis = targetQuat.clone().multiply(quat.clone().conjugate());
+    }
+    
+    cubeQuaternion.copy(basis.clone().multiply(quat));
+
+    // Store velocity for prediction
+    if (event.velocity) {
+      // Rotate velocity vector by our basis to match world space
+      const rawVel = new THREE.Vector3(event.velocity.x, event.velocity.z, -event.velocity.y);
+      lastVelocity.copy(rawVel).multiplyScalar(Math.PI / 180); // convert deg/s to rad/s
+    }
+    
+    lastGyroTimestamp = performance.now();
+    
+    $('#quaternion').val(`x: ${qx.toFixed(3)}, y: ${qy.toFixed(3)}, z: ${qz.toFixed(3)}, w: ${qw.toFixed(3)}`);
+  }
+}
+
+async function handleMoveEvent(event: GanCubeEvent) {
+  if (event.type == "MOVE") {
+    if (timerState == "READY") {
+      setTimerState("RUNNING");
+    }
+    console.log("Move recorded:", event.move);
+    
+    // Scramble progression logic
+    if (scrambleIndex >= 0 && scrambleIndex < currentScramble.length) {
+      const expectedMoveStr = currentScramble[scrambleIndex];
+      const expectedFace = expectedMoveStr[0];
+      const expectedMod = expectedMoveStr.substring(1);
+      
+      const moveFace = event.move[0];
+      const moveMod = event.move.substring(1);
+
+      if (moveFace === expectedFace) {
+        // GAN cubes send singles (' or nothing)
+        const amt = moveMod === "'" ? -1 : 1;
+        accumulatedMoveAmount += amt;
+        
+        // Normalize accumulated to [-1, 0, 1, 2]
+        // (x % n + n) % n is the standard way to handle negative modulo in JS
+        let normalizedAcc = ((accumulatedMoveAmount % 4) + 4) % 4;
+        if (normalizedAcc === 3) normalizedAcc = -1;
+
+        let targetAmt = expectedMod === "'" ? -1 : (expectedMod === "2" ? 2 : 1);
+        
+        // Check if we reached the target orientation for this face
+        let reached = false;
+        if (targetAmt === 2) {
+          reached = (normalizedAcc === 2);
+        } else {
+          reached = (normalizedAcc === targetAmt);
+        }
+
+        if (reached) {
+          scrambleIndex++;
+          accumulatedMoveAmount = 0;
+          updateHighlighter();
+        } else if (normalizedAcc === 0) {
+          // They went back to start or did a full 360, reset progress for this move
+          accumulatedMoveAmount = 0;
+        }
+      } else {
+        // User moved a different face. We reset progress for the current expected move.
+        accumulatedMoveAmount = 0;
+      }
+    }
+
+    // Always push to queue first to maintain chronological order
+    moveQueue.push(event.move);
+    processQueue();
+    
+    lastMoves.push(event);
+    if (timerState == "RUNNING") {
+      solutionMoves.push(event);
+    }
+    if (lastMoves.length > 256) {
+      lastMoves = lastMoves.slice(-256);
+    }
+    if (lastMoves.length > 10) {
+      var skew = cubeTimestampCalcSkew(lastMoves);
+      $('#skew').val(skew + '%');
+    }
+  }
+}
+
+async function handleFaceletsEvent(event: GanCubeEvent) {
+  if (event.type == "FACELETS") {
+    console.log("Facelets:", event.facelets);
+    lastFacelets = event.facelets;
+    
+    // Auto-initialize the digital cube state on the first packet
+    if (!cubeStateInitialized) {
+      applyFacelets(event.facelets);
+      cubeStateInitialized = true;
+      console.log("Digital cube initialized from physical state");
+    }
+
+    if (event.facelets == SOLVED_STATE) {
+      if (timerState == "RUNNING") {
+        setTimerState("STOPPED");
+      }
+    }
+  }
+}
+
+function handleCubeEvent(event: GanCubeEvent) {
+  logToUIConsole(event);
+  if (event.type != "GYRO")
+    console.log("GanCubeEvent", event);
+  if (event.type == "GYRO") {
+    handleGyroEvent(event);
+  } else if (event.type == "MOVE") {
+    handleMoveEvent(event);
+  } else if (event.type == "FACELETS") {
+    handleFaceletsEvent(event);
+  } else if (event.type == "BATTERY") {
+    $('#batteryLevel').val(event.batteryLevel + '%');
+  } else if (event.type == "DISCONNECT") {
+    $('.info input').val('- n/a -');
+    $('#connect').html('Connect');
+    cubeStateInitialized = false;
+  }
+}
+
+const customMacAddressProvider: MacAddressProvider = async (device, isFallbackCall): Promise<string | null> => {
+  if (isFallbackCall) {
+    const remembered = localStorage.getItem('lastCubeMac');
+    if (remembered) return remembered;
+    return prompt('Unable do determine cube MAC address!\nPlease enter MAC address manually:');
+  } else {
+    return typeof device.watchAdvertisements == 'function' ? null :
+      prompt('Seems like your browser does not support Web Bluetooth watchAdvertisements() API. Enable following flag in Chrome:\n\nchrome://flags/#enable-experimental-web-platform-features\n\nor enter cube MAC address manually:');
+  }
+};
+
+async function doConnect() {
+  if (conn) {
+    conn.disconnect();
+    conn = null;
+    $('#connect').html('Connect');
+    $('.info input').val('- n/a -');
+    return;
+  }
+
+  const lastName = localStorage.getItem('lastCubeName');
+  let originalRequestDevice: any = null;
+
+  try {
+    // Hack to bypass the device picker if we already have permission for this device
+    if (lastName && navigator.bluetooth && (navigator.bluetooth as any).getDevices) {
+      originalRequestDevice = navigator.bluetooth.requestDevice;
+      (navigator.bluetooth as any).requestDevice = async (options: any) => {
+        const devices = await (navigator.bluetooth as any).getDevices();
+        const matched = devices.find((d: any) => d.name === lastName);
+        if (matched) {
+          console.log("Bypassing picker, found permitted device:", lastName);
+          return matched;
+        }
+        return originalRequestDevice.call(navigator.bluetooth, options);
+      };
+    }
+
+    conn = await connectGanCube(customMacAddressProvider);
+    
+    // Restore original requestDevice immediately after the library calls it
+    if (originalRequestDevice) {
+      (navigator.bluetooth as any).requestDevice = originalRequestDevice;
+    }
+
+    conn.events$.subscribe(handleCubeEvent);
+    await conn.sendCubeCommand({ type: "REQUEST_HARDWARE" });
+    await conn.sendCubeCommand({ type: "REQUEST_FACELETS" });
+    await conn.sendCubeCommand({ type: "REQUEST_BATTERY" });
+    
+    $('#deviceName').val(conn.deviceName);
+    $('#deviceMAC').val(conn.deviceMAC);
+    localStorage.setItem('lastCubeMac', conn.deviceMAC);
+    localStorage.setItem('lastCubeName', conn.deviceName);
+    $('#connect').html('Disconnect');
+    
+    console.log("Connected to cube:", conn.deviceName);
+  } catch (e) {
+    console.error("Connection failed", e);
+    // Ensure restoration on error
+    if (originalRequestDevice) {
+      (navigator.bluetooth as any).requestDevice = originalRequestDevice;
+    }
+  }
+}
+
+$('#connect').on('click', () => doConnect());
+
+// --- Auto-connect logic ---
+// Check if we have permission for any devices already
+async function checkRememberedDevices() {
+  if (navigator.bluetooth && (navigator.bluetooth as any).getDevices) {
+    try {
+      const devices = await (navigator.bluetooth as any).getDevices();
+      console.log("Found permitted devices:", devices.length);
+      if (devices.length > 0) {
+        const lastName = localStorage.getItem('lastCubeName');
+        if (lastName) {
+          const hasLast = devices.some((d: any) => d.name === lastName);
+          if (hasLast) {
+            console.log(`Bypass available for: ${lastName}`);
+            $('#connect').html(`Auto-Reconnect to ${lastName}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("getDevices failed", e);
+    }
+  }
+}
+
+checkRememberedDevices();
+
+$('#reset-state').on('click', async () => {
+  await conn?.sendCubeCommand({ type: "REQUEST_RESET" });
+  
+  // 1. Kill any active animations
+  gsap.killTweensOf("*");
+
+  // 2. Clear move queue and state
+  moveQueue.length = 0;
+  isProcessingQueue = false;
+  cubeStateInitialized = false;
+
+  // Clear scramble state
+  scrambleIndex = -1;
+  accumulatedMoveAmount = 0;
+  currentScramble = [];
+  $('#scramble-display').hide();
+  highlighterGroup.clear();
+
+  // 3. Reset all pieces
+  cubies.forEach(cubie => {
+    // If cubie was attached to a pivot, bring it back home first
+    if (cubie.parent !== mainCubeGroup) {
+      mainCubeGroup.attach(cubie);
+    }
+
+    const init = (cubie as any)._initialTransform;
+    if (init) {
+      cubie.position.copy(init.position);
+      cubie.quaternion.copy(init.quaternion);
+    }
+  });
+
+  // 4. Remove any temporary pivot groups from mainCubeGroup
+  const pivots = mainCubeGroup.children.filter(c => !cubies.includes(c as THREE.Group));
+  pivots.forEach(p => mainCubeGroup.remove(p));
+});
+
+$('#reset-gyro').on('click', async () => {
+  basis = null;
+});
+
+// --- Timer Logic ---
+
+function setTimerState(state: typeof timerState) {
+  timerState = state;
+  switch (state) {
+    case "IDLE":
+      stopLocalTimer();
+      $('#timer').css('color', '#fff');
+      break;
+    case 'READY':
+      setTimerValue(0);
+      $('#timer').css('color', '#0f0');
+      break;
+    case 'RUNNING':
+      solutionMoves = [];
+      startLocalTimer();
+      $('#timer').css('color', '#999');
+      break;
+    case 'STOPPED':
+      stopLocalTimer();
+      $('#timer').css('color', '#fff');
+      var fittedMoves = cubeTimestampLinearFit(solutionMoves);
+      var lastMove = fittedMoves.slice(-1).pop();
+      setTimerValue(lastMove ? lastMove.cubeTimestamp! : 0);
+      break;
+  }
+}
+
+function setTimerValue(timestamp: number) {
+  let t = makeTimeFromTimestamp(timestamp);
+  $('#timer').html(`${t.minutes}:${t.seconds.toString(10).padStart(2, '0')}.${t.milliseconds.toString(10).padStart(3, '0')}`);
+}
+
+function startLocalTimer() {
+  var startTime = now();
+  localTimer = interval(30).subscribe(() => {
+    setTimerValue(now() - startTime);
+  });
+}
+
+function stopLocalTimer() {
+  localTimer?.unsubscribe();
+  localTimer = null;
+}
+
+function activateTimer() {
+  if (timerState == "IDLE" && conn) {
+    setTimerState("READY");
+  } else {
+    setTimerState("IDLE");
+  }
+}
+
+$(document).on('keydown', (event) => {
+  if (event.which == 32) {
+    event.preventDefault();
+    activateTimer();
+  }
+});
+
+$('#cube-container').on('touchstart', () => {
+  activateTimer();
+});
+
 const DEFAULT_COLORS = {
-  Top: 0xffffff,
-  Bottom: 0xffff00,
-  Front: 0x00ff00,
-  Back: 0x0000ff,
-  Left: 0xffa500,
-  Right: 0xff0000,
-  Plastic: 0x111111
+    Top: 0xffffff,
+    Bottom: 0xffff00,
+    Front: 0x00ff00,
+    Back: 0x0000ff,
+    Left: 0xffa500,
+    Right: 0xff0000,
+    Plastic: 0x111111
 } satisfies CubieOptions['colors'];
 
 var COLORS = {
@@ -489,21 +1383,57 @@ var COLORS = {
   Right: DEFAULT_COLORS.Right,
   Plastic: DEFAULT_COLORS.Plastic
 }
+
+const SLOTS = {
+  // Centers
+  U: { x: 0, y: 1, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, 0)) },
+  D: { x: 0, y: -1, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI, 0, 0)) },
+  L: { x: -1, y: 0, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, Math.PI * 0.5)) },
+  R: { x: 1, y: 0, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, Math.PI * 1.5)) },
+  F: { x: 0, y: 0, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI * 0.5, 0, 0)) },
+  B: { x: 0, y: 0, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI * 1.5, 0, 0)) },
+
+  // Top Edges
+  UF: { x: 0, y: 1, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, 0)) },
+  UL: { x: -1, y: 1, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.5, 0)) },
+  UB: { x: 0, y: 1, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.0, 0)) },
+  UR: { x: 1, y: 1, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 0.5, 0)) },
+
+  // Bottom Edges
+  DF: { x: 0, y: -1, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, Math.PI)) },
+  DL: { x: -1, y: -1, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.5, Math.PI)) },
+  DB: { x: 0, y: -1, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.0, Math.PI)) },
+  DR: { x: 1, y: -1, z: 0, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 0.5, Math.PI)) },
+
+  // Mid Edges
+  FR: { x: 1, y: 0, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, Math.PI * 1.5)) },
+  FL: { x: -1, y: 0, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.5, Math.PI * 1.5)) },
+  BR: { x: 1, y: 0, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.0, Math.PI * 0.5)) },
+  BL: { x: -1, y: 0, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.0, Math.PI * 1.5)) },
+
+  // Top Corners
+  UFR: { x: 1, y: 1, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, 0)) },
+  UBR: { x: 1, y: 1, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 0.5, 0)) },
+  UBL: { x: -1, y: 1, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.0, 0)) },
+  UFL: { x: -1, y: 1, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.5, 0)) },
+
+  // Bottom Corners
+  DFR: { x: 1, y: -1, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 0.5, Math.PI)) },
+  DBR: { x: 1, y: -1, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.0, Math.PI)) },
+  DBL: { x: -1, y: -1, z: -1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI * 1.5, Math.PI)) },
+  DFL: { x: -1, y: -1, z: 1, q: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, Math.PI)) },
+} as const;
+
 //Centers
 
 // Top
 createCubie({
-  x: 0, y: 1, z: 0,
-  // Per-axis radius lets you form cylinders, e.g. (0.5, 0, 0.5) makes a Y-axis cylinder in a 1x1x1 cubie.
+  id: 'U',
+  slot: SLOTS.U,
   radiusX: 0.5,
   radiusY: 0.0,
   radiusZ: 0.5,
-  rx: 0, ry: 0, rz: 0,
-  activeEdges: [
-    1,1,1,1, // Top: left, front, right, back
-    1,1,1,1, // Bottom: left, front, right, back
-    1,1,1,1  // Mid: front-left, front-right, back-left, back-right
-  ].map(v => !!v),
+  activeEdges: new Array(12).fill(true),
   colors: {
     Top: COLORS.Top,
     Plastic: 0x111111
@@ -512,37 +1442,26 @@ createCubie({
 
 // Bottom
 createCubie({
-  x: 0, y: -1, z: 0,
-  // Per-axis radius lets you form cylinders, e.g. (0.5, 0, 0.5) makes a Y-axis cylinder in a 1x1x1 cubie.
+  id: 'D',
+  slot: SLOTS.D,
   radiusX: 0.5,
   radiusY: 0.0,
   radiusZ: 0.5,
-  rx: Math.PI, ry: 0, rz: 0,
-  activeEdges: [
-    1,1,1,1, // Top: left, front, right, back
-    1,1,1,1, // Bottom: left, front, right, back
-    1,1,1,1  // Mid: front-left, front-right, back-left, back-right
-  ].map(v => !!v),
+  activeEdges: new Array(12).fill(true),
   colors: {
     Top: COLORS.Bottom,
     Plastic: 0x111111
   }
 });
 
-
 // Left
 createCubie({
-  x: -1, y: 0, z: 0,
-  // Per-axis radius lets you form cylinders, e.g. (0.5, 0, 0.5) makes a Y-axis cylinder in a 1x1x1 cubie.
+  id: 'L',
+  slot: SLOTS.L,
   radiusX: 0.5,
   radiusY: 0.0,
   radiusZ: 0.5,
-  rx: 0, ry: 0, rz: Math.PI*0.5,
-  activeEdges: [
-    1,1,1,1, // Top: left, front, right, back
-    1,1,1,1, // Bottom: left, front, right, back
-    1,1,1,1  // Mid: front-left, front-right, back-left, back-right
-  ].map(v => !!v),
+  activeEdges: new Array(12).fill(true),
   colors: {
     Top: COLORS.Left,
     Plastic: 0x111111
@@ -551,17 +1470,12 @@ createCubie({
 
 // Right
 createCubie({
-  x: 1, y: 0, z: 0,
-  // Per-axis radius lets you form cylinders, e.g. (0.5, 0, 0.5) makes a Y-axis cylinder in a 1x1x1 cubie.
+  id: 'R',
+  slot: SLOTS.R,
   radiusX: 0.5,
   radiusY: 0.0,
   radiusZ: 0.5,
-  rx: 0, ry: 0, rz: Math.PI*1.5,
-  activeEdges: [
-    1,1,1,1, // Top: left, front, right, back
-    1,1,1,1, // Bottom: left, front, right, back
-    1,1,1,1  // Mid: front-left, front-right, back-left, back-right
-  ].map(v => !!v),
+  activeEdges: new Array(12).fill(true),
   colors: {
     Top: COLORS.Right,
     Plastic: 0x111111
@@ -570,17 +1484,12 @@ createCubie({
 
 // Front
 createCubie({
-  x: 0, y: 0, z: 1,
-  // Per-axis radius lets you form cylinders, e.g. (0.5, 0, 0.5) makes a Y-axis cylinder in a 1x1x1 cubie.
+  id: 'F',
+  slot: SLOTS.F,
   radiusX: 0.5,
   radiusY: 0.0,
   radiusZ: 0.5,
-  rx: Math.PI*0.5, ry: 0, rz: 0,
-  activeEdges: [
-    1,1,1,1, // Top: left, front, right, back
-    1,1,1,1, // Bottom: left, front, right, back
-    1,1,1,1  // Mid: front-left, front-right, back-left, back-right
-  ].map(v => !!v),
+  activeEdges: new Array(12).fill(true),
   colors: {
     Top: COLORS.Front,
     Plastic: 0x111111
@@ -589,17 +1498,12 @@ createCubie({
 
 // Back
 createCubie({
-  x: 0, y: 0, z: -1,
-  // Per-axis radius lets you form cylinders, e.g. (0.5, 0, 0.5) makes a Y-axis cylinder in a 1x1x1 cubie.
+  id: 'B',
+  slot: SLOTS.B,
   radiusX: 0.5,
   radiusY: 0.0,
   radiusZ: 0.5,
-  rx: Math.PI*1.5, ry: 0, rz: 0,
-  activeEdges: [
-    1,1,1,1, // Top: left, front, right, back
-    1,1,1,1, // Bottom: left, front, right, back
-    1,1,1,1  // Mid: front-left, front-right, back-left, back-right
-  ].map(v => !!v),
+  activeEdges: new Array(12).fill(true),
   colors: {
     Top: COLORS.Back,
     Plastic: 0x111111
@@ -608,15 +1512,14 @@ createCubie({
 
 
 // Top Edges
-// TF
+// UF
 createCubie({
-  x: 0, y: 1, z: 1,
+  id: 'UF',
+  slot: SLOTS.UF,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -625,16 +1528,14 @@ createCubie({
   }
 });
 
-// TL
+// UL
 createCubie({
-  x: -1, y: 1, z: 0,
-  rx: Math.PI*2, ry: Math.PI*1.5,
+  id: 'UL',
+  slot: SLOTS.UL,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -643,16 +1544,14 @@ createCubie({
   }
 });
 
-// TL
+// UB
 createCubie({
-  x: 0, y: 1, z: -1,
-  rx: Math.PI*2, ry: Math.PI*1,
+  id: 'UB',
+  slot: SLOTS.UB,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -661,16 +1560,14 @@ createCubie({
   }
 });
 
-// TR
+// UR
 createCubie({
-  x: 1, y: 1, z: 0,
-  rx: Math.PI*2, ry: Math.PI/2,
+  id: 'UR',
+  slot: SLOTS.UR,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -681,16 +1578,14 @@ createCubie({
 
 
 // Bottom Edges
-// BF
+// DF
 createCubie({
-  x: 0, y: -1, z: 1,
-  rx: Math.PI*0, ry: Math.PI*0, rz: Math.PI*1,
+  id: 'DF',
+  slot: SLOTS.DF,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -699,16 +1594,14 @@ createCubie({
   }
 });
 
-// TL
+// DL
 createCubie({
-  x: -1, y: -1, z: 0,
-  rx: Math.PI*2, ry: Math.PI*1.5, rz: Math.PI*1,
+  id: 'DL',
+  slot: SLOTS.DL,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -717,16 +1610,14 @@ createCubie({
   }
 });
 
-// TL
+// DB
 createCubie({
-  x: 0, y: -1, z: -1,
-  rx: Math.PI*2, ry: Math.PI*1, rz: Math.PI*1,
+  id: 'DB',
+  slot: SLOTS.DB,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -735,16 +1626,14 @@ createCubie({
   }
 });
 
-// TR
+// DR
 createCubie({
-  x: 1, y: -1, z: 0,
-  rx: Math.PI*2, ry: Math.PI/2, rz: Math.PI*1,
+  id: 'DR',
+  slot: SLOTS.DR,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -757,14 +1646,12 @@ createCubie({
 // Mid Edges
 // FR
 createCubie({
-  x: 1, y: 0, z: 1,
-  rx: Math.PI*0, ry: Math.PI*0, rz: Math.PI*1.5,
+  id: 'FR',
+  slot: SLOTS.FR,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Right,
@@ -775,14 +1662,12 @@ createCubie({
 
 // FL
 createCubie({
-  x: -1, y: 0, z: 1,
-  rx: Math.PI*2, ry: Math.PI*1.5, rz: Math.PI*1.5,
+  id: 'FL',
+  slot: SLOTS.FL,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Front,
@@ -793,14 +1678,12 @@ createCubie({
 
 // BR
 createCubie({
-  x: 1, y: 0, z: -1,
-  rx: Math.PI*2, ry: Math.PI*1, rz: Math.PI*0.5,
+  id: 'BR',
+  slot: SLOTS.BR,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Right,
@@ -811,14 +1694,12 @@ createCubie({
 
 // BL
 createCubie({
-  x: -1, y: 0, z: -1,
-  rx: Math.PI*2, ry: Math.PI*1, rz: Math.PI*1.5,
+  id: 'BL',
+  slot: SLOTS.BL,
   profiles: {
-    // "From the front" = looking along Z, so the silhouette lives in XY. Round the +Y side (the "top").
     y: { kind: 'd', radius: cubieSize / 2, roundSide: '+z' },    
     z: { kind: 'd', radius: cubieSize / 2, roundSide: '-y' }
   },
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Left,
@@ -829,9 +1710,8 @@ createCubie({
 // TOP CORNERS
 // TFR
 createCubie({
-  x: 1, y: 1, z: 1,
-  rx: Math.PI*0, ry: Math.PI*0, rz: Math.PI*0,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'UFR',
+  slot: SLOTS.UFR,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -843,9 +1723,8 @@ createCubie({
 
 // TBR
 createCubie({
-  x: 1, y: 1, z: -1,
-  rx: Math.PI*2, ry: Math.PI*0.5, rz: Math.PI*0,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'UBR',
+  slot: SLOTS.UBR,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -857,9 +1736,8 @@ createCubie({
 
 // TBL
 createCubie({
-  x: -1, y: 1, z: -1,
-  rx: Math.PI*0, ry: Math.PI*1, rz: Math.PI*0,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'UBL',
+  slot: SLOTS.UBL,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -871,9 +1749,8 @@ createCubie({
 
 // TFL
 createCubie({
-  x: -1, y: 1, z: 1,
-  rx: Math.PI*0, ry: Math.PI*1.5, rz: Math.PI*0,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'UFL',
+  slot: SLOTS.UFL,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Top,
@@ -886,9 +1763,8 @@ createCubie({
 // Bottom CORNERS
 // DFR
 createCubie({
-  x: 1, y: -1, z: 1,
-  rx: Math.PI*0, ry: Math.PI*0.5, rz: Math.PI*1,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'DFR',
+  slot: SLOTS.DFR,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -900,9 +1776,8 @@ createCubie({
 
 // DBR
 createCubie({
-  x: 1, y: -1, z: -1,
-  rx: Math.PI*2, ry: Math.PI*1, rz: Math.PI*1,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'DBR',
+  slot: SLOTS.DBR,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -914,9 +1789,8 @@ createCubie({
 
 // DBL
 createCubie({
-  x: -1, y: -1, z: -1,
-  rx: Math.PI*0, ry: Math.PI*1.5, rz: Math.PI*1,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'DBL',
+  slot: SLOTS.DBL,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -928,9 +1802,8 @@ createCubie({
 
 // DFL
 createCubie({
-  x: -1, y: -1, z: 1,
-  rx: Math.PI*0, ry: Math.PI*0, rz: Math.PI*1,
-  // These are ignored in profile/solid mode today, but kept for API compatibility.
+  id: 'DFL',
+  slot: SLOTS.DFL,
   activeEdges: new Array(12).fill(false),
   colors: { 
     Top: DEFAULT_COLORS.Bottom,
@@ -950,8 +1823,42 @@ createCubie({
 
 
 
+let lastFrameTime = performance.now();
 function animate() {
+  const currentTime = performance.now();
+  const delta = (currentTime - lastFrameTime) / 1000;
+  lastFrameTime = currentTime;
+
   requestAnimationFrame(animate);
+  controls.update();
+  
+  if (mainCubeGroup) {
+    // 1. Prediction: Extrapolate rotation using angular velocity
+    // We only extrapolate for up to 100ms after the last packet to avoid drift
+    const timeSinceLastPacket = (currentTime - lastGyroTimestamp) / 1000;
+    if (timeSinceLastPacket < 0.1) {
+      const axis = lastVelocity.clone().normalize();
+      const speed = lastVelocity.length();
+      if (speed > 0.001) {
+        const stepQuat = new THREE.Quaternion().setFromAxisAngle(axis, speed * delta);
+        cubeQuaternion.premultiply(stepQuat);
+      }
+    }
+
+    // 2. Smoothing: Slerp towards our target
+    mainCubeGroup.quaternion.slerp(cubeQuaternion, 0.35);
+
+    // 3. Pulse Highlighter
+    if (highlighterGroup.children.length > 0) {
+      const pulse = 1.5 + Math.sin(currentTime * 0.01) * 0.5;
+      highlighterGroup.traverse((child) => {
+        if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshPhysicalMaterial) {
+          child.material.emissiveIntensity = pulse;
+        }
+      });
+    }
+  }
+  
   renderer.render(scene, camera);
 }
 animate();
